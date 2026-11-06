@@ -24,6 +24,7 @@ dependencies:
   encrypt: ^5.0.3
   crypto: ^3.0.3
   excel: ^4.0.6
+  file_saver: ^0.2.14
 
 dev_dependencies:
   flutter_lints: ^3.0.0
@@ -182,15 +183,23 @@ class Backup {
   }
 }
 ===FILE: lib/core/export.dart ===
-import 'dart:io';
+import 'dart:typed_data';
 import 'package:excel/excel.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
+import 'package:file_saver/file_saver.dart';
 import 'ledger.dart';
 import 'store.dart';
 import 'util.dart';
 
-/// تصدير تقرير الفترة إلى ملف إكسل، ثم فتح قائمة المشاركة.
+/// اسم الملف بالعربي: تقرير يوم واحد يُسمّى باسم اليوم والتاريخ، والفترة تُسمّى بالتاريخين.
+String reportFileName(String from, String to) {
+  if (from == to) {
+    final d = parseYmd(from);
+    return 'تقرير يوم ${dayName(d)} $from';
+  }
+  return 'تقرير من $from إلى $to';
+}
+
+/// تصدير تقرير الفترة إلى ملف إكسل يُحفظ مباشرة في تنزيلات الهاتف.
 /// المرفقات تظهر هنا بأسمائها ومواضعها فقط، والصور الكاملة في ملف PDF.
 Future<void> exportExcel({
   required String from,
@@ -272,11 +281,13 @@ Future<void> exportExcel({
   addRow(['المسؤول المالي'], bold: true);
   addRow([username]);
 
-  final bytes = excel.encode() ?? <int>[];
-  final dir = await getTemporaryDirectory();
-  final file = File('${dir.path}/hisabati_${from}_$to.xlsx');
-  await file.writeAsBytes(bytes);
-  await Share.shareXFiles([XFile(file.path)], text: 'تقرير - البزي');
+  final bytes = Uint8List.fromList(excel.encode() ?? <int>[]);
+  await FileSaver.instance.saveFile(
+    name: reportFileName(from, to),
+    bytes: bytes,
+    ext: 'xlsx',
+    mimeType: MimeType.microsoftExcel,
+  );
 }
 ===FILE: lib/core/kdf.dart ===
 import 'dart:convert';
@@ -1690,7 +1701,14 @@ class _ReportsTabState extends State<ReportsTab> {
               IconButton(
                 tooltip: 'تصدير إكسل',
                 icon: const Icon(Icons.table_chart_outlined),
-                onPressed: () => exportExcel(from: from, to: to, username: Auth.username),
+                onPressed: () async {
+                  await exportExcel(from: from, to: to, username: Auth.username);
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('تم حفظ ملف الإكسل في تنزيلات الهاتف')),
+                    );
+                  }
+                },
               ),
             ],
           ),
