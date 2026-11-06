@@ -184,7 +184,8 @@ class Backup {
   }
 }
 ===FILE: lib/core/export.dart ===
-import 'dart:io';
+import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
 import 'package:excel/excel.dart';
 import 'ledger.dart';
 import 'store.dart';
@@ -201,7 +202,7 @@ String reportTitle(String from, String to) {
 /// تصدير تقرير الفترة إلى ملف إكسل يُحفظ في مجلد التنزيلات العام.
 /// الجدول مكتوب من اليمين إلى اليسار بعكس ترتيب الأعمدة، ليظهر التاريخ في أقصى اليمين.
 /// المرفقات تظهر هنا بأسمائها ومواضعها فقط، والصور الكاملة في ملف PDF.
-Future<String> exportExcel({
+Future<String?> exportExcel({
   required String from,
   required String to,
   required String username,
@@ -329,15 +330,19 @@ Future<String> exportExcel({
   final bytes = excel.encode() ?? <int>[];
   if (bytes.isEmpty) throw StateError('الملف فارغ');
 
-  final dir = Directory('/storage/emulated/0/Download/التقارير');
-  if (!await dir.exists()) await dir.create(recursive: true);
-  final file = File('${dir.path}/${reportTitle(from, to)}.xlsx');
-  await file.writeAsBytes(bytes, flush: true);
-  return file.path;
+  final path = await FilePicker.platform.saveFile(
+    dialogTitle: 'اختر مكان حفظ التقرير',
+    fileName: '${reportTitle(from, to)}.xlsx',
+    bytes: Uint8List.fromList(bytes),
+    type: FileType.custom,
+    allowedExtensions: ['xlsx'],
+  );
+  return path;
 }
 ===FILE: lib/core/export_pdf.dart ===
 import 'dart:convert';
-import 'dart:io';
+import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
 import 'package:pdf/pdf.dart';
 import 'package:printing/printing.dart' show PdfGoogleFonts;
 import 'package:pdf/widgets.dart' as pw;
@@ -348,7 +353,7 @@ import 'util.dart';
 
 /// تصدير تقرير الفترة إلى PDF بصفحات A4، ويُحفظ في مجلد التقارير داخل التنزيلات.
 /// خط Cairo يُحمَّل تلقائياً من الإنترنت عند أول تصدير.
-Future<String> exportPdf({
+Future<String?> exportPdf({
   required String from,
   required String to,
   required String username,
@@ -513,11 +518,14 @@ Future<String> exportPdf({
   ));
 
   final bytes = await doc.save();
-  final dir = Directory('/storage/emulated/0/Download/التقارير');
-  if (!await dir.exists()) await dir.create(recursive: true);
-  final file = File('${dir.path}/${reportTitle(from, to)}.pdf');
-  await file.writeAsBytes(bytes, flush: true);
-  return file.path;
+  final path = await FilePicker.platform.saveFile(
+    dialogTitle: 'اختر مكان حفظ التقرير',
+    fileName: '${reportTitle(from, to)}.pdf',
+    bytes: bytes,
+    type: FileType.custom,
+    allowedExtensions: ['pdf'],
+  );
+  return path;
 }
 ===FILE: lib/core/kdf.dart ===
 import 'dart:convert';
@@ -2026,7 +2034,7 @@ class _ReportsTabState extends State<ReportsTab> {
                         String msg;
                         try {
                           final path = await exportExcel(from: from, to: to, username: Auth.username);
-                          msg = 'تم الحفظ في: $path';
+                          msg = path == null ? 'تم إلغاء الحفظ' : 'تم الحفظ في: $path';
                         } catch (e) {
                           msg = 'تعذّر الحفظ: $e';
                         }
@@ -2047,7 +2055,7 @@ class _ReportsTabState extends State<ReportsTab> {
                         String msg;
                         try {
                           final path = await exportPdf(from: from, to: to, username: Auth.username);
-                          msg = 'تم الحفظ في: $path';
+                          msg = path == null ? 'تم إلغاء الحفظ' : 'تم الحفظ في: $path';
                         } catch (e) {
                           msg = 'تعذّر تصدير PDF: $e';
                         }
