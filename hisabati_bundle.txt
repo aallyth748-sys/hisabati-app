@@ -274,7 +274,6 @@ Future<String?> exportExcel({
 
   // ترويسة التقرير
   addRow([reportTitle(from, to)], style(bold: true, size: 16, font: green, boxed: false));
-  addRow(['البزي'], style(size: 11, font: '#666666', boxed: false));
   spacer();
 
   // أقسام الحركات
@@ -386,11 +385,6 @@ Future<String?> exportPdf({
   final content = <pw.Widget>[];
 
   // الترويسة
-  content.add(pw.Center(
-    child: pw.Text('البزي',
-        style: pw.TextStyle(fontSize: 22, color: green, fontWeight: pw.FontWeight.bold)),
-  ));
-  content.add(pw.SizedBox(height: 4));
   content.add(pw.Center(
     child: pw.Text(reportTitle(from, to),
         style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
