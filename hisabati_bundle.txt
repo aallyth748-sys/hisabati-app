@@ -244,8 +244,8 @@ Future<String> exportExcel({
       CellStyle(
         bold: bold,
         fontSize: size,
-        fontColorHex: font == null ? null : ExcelColor.fromHexString(font),
-        backgroundColorHex: bg == null ? null : ExcelColor.fromHexString(bg),
+        fontColorHex: font == null ? ExcelColor.black : ExcelColor.fromHexString(font),
+        backgroundColorHex: bg == null ? ExcelColor.none : ExcelColor.fromHexString(bg),
         horizontalAlign: align,
         verticalAlign: VerticalAlign.Center,
         leftBorder: boxed ? border : null,
