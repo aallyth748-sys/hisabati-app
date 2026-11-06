@@ -188,16 +188,16 @@ import 'ledger.dart';
 import 'store.dart';
 import 'util.dart';
 
-/// اسم الملف بالعربي: تقرير يوم واحد يُسمّى باسم اليوم والتاريخ، والفترة تُسمّى بالتاريخين.
-String reportFileName(String from, String to) {
+/// عنوان التقرير: يوم واحد يُكتب باسم اليوم، والفترة تُكتب بتاريخ البداية والنهاية.
+String reportTitle(String from, String to) {
   if (from == to) {
-    final d = parseYmd(from);
-    return 'تقرير يوم ${dayName(d)} $from';
+    return 'تقرير يوم ${dayName(parseYmd(from))} $from';
   }
   return 'تقرير من $from إلى $to';
 }
 
-/// تصدير تقرير الفترة إلى ملف إكسل يُحفظ مباشرة في تنزيلات الهاتف.
+/// تصدير تقرير الفترة إلى ملف إكسل يُحفظ في مجلد التنزيلات العام.
+/// الجدول مكتوب من اليمين إلى اليسار بعكس ترتيب الأعمدة، ليظهر التاريخ في أقصى اليمين.
 /// المرفقات تظهر هنا بأسمائها ومواضعها فقط، والصور الكاملة في ملف PDF.
 Future<String> exportExcel({
   required String from,
@@ -220,71 +220,116 @@ Future<String> exportExcel({
   final sheet = excel['التقرير'];
   excel.delete('Sheet1');
 
-  void addRow(List<Object> values, {bool bold = false}) {
-    sheet.appendRow(values
+  sheet.setColumnWidth(0, 32); // الملاحظة
+  sheet.setColumnWidth(1, 18); // المبلغ
+  sheet.setColumnWidth(2, 28); // الاسم
+  sheet.setColumnWidth(3, 18); // التاريخ
+
+  const green = '#1B8A5A';
+  const lightGreen = '#DDF1E7';
+  const lightGrey = '#F1F1F1';
+  final border = Border(
+    borderStyle: BorderStyle.Thin,
+    borderColorHex: ExcelColor.fromHexString('#9E9E9E'),
+  );
+
+  CellStyle style({
+    bool bold = false,
+    int size = 11,
+    String? font,
+    String? bg,
+    HorizontalAlign align = HorizontalAlign.Right,
+    bool boxed = true,
+  }) =>
+      CellStyle(
+        bold: bold,
+        fontSize: size,
+        fontColorHex: font == null ? null : ExcelColor.fromHexString(font),
+        backgroundColorHex: bg == null ? null : ExcelColor.fromHexString(bg),
+        horizontalAlign: align,
+        verticalAlign: VerticalAlign.Center,
+        leftBorder: boxed ? border : null,
+        rightBorder: boxed ? border : null,
+        topBorder: boxed ? border : null,
+        bottomBorder: boxed ? border : null,
+      );
+
+  /// يكتب سطراً بأربعة أعمدة، ويطبّق عليه التنسيق. القيم تُكتب بترتيب اليمين إلى اليسار.
+  void addRow(List<Object> logical, CellStyle s) {
+    final padded = <Object>[...logical, ...List.filled(4 - logical.length, '')];
+    final cells = padded.reversed
         .map((v) => v is int ? IntCellValue(v) : TextCellValue(v.toString()))
-        .toList());
-    if (bold) {
-      final r = sheet.maxRows - 1;
-      for (var c = 0; c < values.length; c++) {
-        sheet
-            .cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: r))
-            .cellStyle = CellStyle(bold: true);
-      }
+        .toList();
+    sheet.appendRow(cells);
+    final r = sheet.maxRows - 1;
+    for (var c = 0; c < 4; c++) {
+      sheet.cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: r)).cellStyle = s;
     }
   }
 
-  addRow(['البزي'], bold: true);
-  addRow(['تقرير من ${fmtDate(parseYmd(from))} إلى ${fmtDate(parseYmd(to))}']);
-  addRow(['']);
+  void spacer() => sheet.appendRow([TextCellValue('')]);
 
+  // ترويسة التقرير
+  addRow([reportTitle(from, to)], style(bold: true, size: 16, font: green, boxed: false));
+  addRow(['البزي'], style(size: 11, font: '#666666', boxed: false));
+  spacer();
+
+  // أقسام الحركات
   for (final kind in spendingKinds) {
     final list = entries.where((e) => e['kind'] == kind).toList();
-    addRow([kindLabels[kind]!], bold: true);
-    addRow(['التاريخ', fieldLabels[kind]!, 'المبلغ', 'ملاحظة'], bold: true);
+    addRow([kindLabels[kind]!], style(bold: true, size: 12, font: '#FFFFFF', bg: green));
+    addRow(
+      ['التاريخ', fieldLabels[kind]!, 'المبلغ', 'ملاحظة'],
+      style(bold: true, bg: lightGreen, align: HorizontalAlign.Center),
+    );
     for (final e in list) {
       addRow([
-        fmtDate(parseYmd(e['date'] as String)),
+        e['date'] as String,
         entryTitle(e),
         amountOf(e),
         (e['note'] as String?) ?? '',
-      ]);
+      ], style());
     }
-    addRow(['الإجمالي', '', sumOf(list), ''], bold: true);
-    addRow(['']);
+    addRow(['الإجمالي', '', sumOf(list), ''], style(bold: true, bg: lightGrey));
+    spacer();
   }
 
-  addRow(['الاستلام'], bold: true);
-  addRow(['التاريخ', 'المبلغ'], bold: true);
+  // الاستلام
+  addRow(['الاستلام'], style(bold: true, size: 12, font: '#FFFFFF', bg: green));
+  addRow(['التاريخ', 'المبلغ'], style(bold: true, bg: lightGreen, align: HorizontalAlign.Center));
   for (final e in entries.where((e) => e['kind'] == kindReceived)) {
-    addRow([fmtDate(parseYmd(e['date'] as String)), amountOf(e)]);
+    addRow([e['date'] as String, amountOf(e)], style());
   }
-  addRow(['']);
+  spacer();
 
-  addRow(['الملخص'], bold: true);
-  addRow(['إجمالي المستلم', received]);
-  addRow(['إجمالي المصروف', spent]);
-  addRow([
-    last == null || last.end >= 0 ? 'المتبقي' : 'المديونية',
-    last == null ? 0 : last.end.abs(),
-  ], bold: true);
-  addRow(['']);
+  // الملخص
+  addRow(['الملخص'], style(bold: true, size: 12, font: '#FFFFFF', bg: green));
+  addRow(['إجمالي المستلم', received], style());
+  addRow(['إجمالي المصروف', spent], style());
+  final endValue = last == null ? 0 : last.end;
+  addRow(
+    [endValue >= 0 ? 'المتبقي' : 'المديونية', endValue.abs()],
+    style(bold: true, size: 13, font: endValue >= 0 ? green : '#C62828', bg: lightGrey),
+  );
+  spacer();
 
-  addRow(['المرفقات (صور الفواتير)'], bold: true);
+  // المرفقات
+  addRow(['المرفقات (صور الفواتير)'], style(bold: true, size: 12, font: '#FFFFFF', bg: green));
   for (var i = 0; i < photos.length; i++) {
-    addRow([fmtDate(parseYmd(photos[i]['date'] as String)), 'فاتورة ${i + 1}']);
+    addRow([photos[i]['date'] as String, 'فاتورة ${i + 1}'], style());
   }
-  addRow(['']);
+  spacer();
 
-  addRow(['المسؤول المالي'], bold: true);
-  addRow([username]);
+  // التذييل
+  addRow(['المسؤول المالي'], style(bold: true, boxed: false));
+  addRow([username], style(size: 12, boxed: false));
 
   final bytes = excel.encode() ?? <int>[];
   if (bytes.isEmpty) throw StateError('الملف فارغ');
 
-  final dir = Directory('/storage/emulated/0/Download');
+  final dir = Directory('/storage/emulated/0/Download/التقارير');
   if (!await dir.exists()) await dir.create(recursive: true);
-  final file = File('${dir.path}/${reportFileName(from, to)}.xlsx');
+  final file = File('${dir.path}/${reportTitle(from, to)}.xlsx');
   await file.writeAsBytes(bytes, flush: true);
   return file.path;
 }
