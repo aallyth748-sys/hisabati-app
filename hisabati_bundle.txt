@@ -23,6 +23,7 @@ dependencies:
   path_provider: ^2.1.4
   encrypt: ^5.0.3
   crypto: ^3.0.3
+  excel: ^4.0.6
 
 dev_dependencies:
   flutter_lints: ^3.0.0
@@ -179,6 +180,103 @@ class Backup {
     if (path == null) return null;
     return File(path).readAsString();
   }
+}
+===FILE: lib/core/export.dart ===
+import 'dart:io';
+import 'package:excel/excel.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'ledger.dart';
+import 'store.dart';
+import 'util.dart';
+
+/// تصدير تقرير الفترة إلى ملف إكسل، ثم فتح قائمة المشاركة.
+/// المرفقات تظهر هنا بأسمائها ومواضعها فقط، والصور الكاملة في ملف PDF.
+Future<void> exportExcel({
+  required String from,
+  required String to,
+  required String username,
+}) async {
+  bool inRange(String d) => d.compareTo(from) >= 0 && d.compareTo(to) <= 0;
+
+  final rows = Ledger.build().where((r) => inRange(r.date)).toList();
+  final entries = Store.all('entries').where((e) => inRange(e['date'] as String)).toList()
+    ..sort((a, b) => (a['date'] as String).compareTo(b['date'] as String));
+  final photos = Store.all('attachments').where((a) => inRange(a['date'] as String)).toList()
+    ..sort((a, b) => (a['date'] as String).compareTo(b['date'] as String));
+
+  final received = rows.fold<int>(0, (s, r) => s + r.received);
+  final spent = rows.fold<int>(0, (s, r) => s + r.spent);
+  final last = rows.isEmpty ? null : rows.last;
+
+  final excel = Excel.createExcel();
+  final sheet = excel['التقرير'];
+  excel.delete('Sheet1');
+
+  void addRow(List<Object> values, {bool bold = false}) {
+    sheet.appendRow(values
+        .map((v) => v is int ? IntCellValue(v) : TextCellValue(v.toString()))
+        .toList());
+    if (bold) {
+      final r = sheet.maxRows - 1;
+      for (var c = 0; c < values.length; c++) {
+        sheet
+            .cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: r))
+            .cellStyle = CellStyle(bold: true);
+      }
+    }
+  }
+
+  addRow(['البزي'], bold: true);
+  addRow(['تقرير من ${fmtDate(parseYmd(from))} إلى ${fmtDate(parseYmd(to))}']);
+  addRow(['']);
+
+  for (final kind in spendingKinds) {
+    final list = entries.where((e) => e['kind'] == kind).toList();
+    addRow([kindLabels[kind]!], bold: true);
+    addRow(['التاريخ', fieldLabels[kind]!, 'المبلغ', 'ملاحظة'], bold: true);
+    for (final e in list) {
+      addRow([
+        fmtDate(parseYmd(e['date'] as String)),
+        entryTitle(e),
+        amountOf(e),
+        (e['note'] as String?) ?? '',
+      ]);
+    }
+    addRow(['الإجمالي', '', sumOf(list), ''], bold: true);
+    addRow(['']);
+  }
+
+  addRow(['الاستلام'], bold: true);
+  addRow(['التاريخ', 'المبلغ'], bold: true);
+  for (final e in entries.where((e) => e['kind'] == kindReceived)) {
+    addRow([fmtDate(parseYmd(e['date'] as String)), amountOf(e)]);
+  }
+  addRow(['']);
+
+  addRow(['الملخص'], bold: true);
+  addRow(['إجمالي المستلم', received]);
+  addRow(['إجمالي المصروف', spent]);
+  addRow([
+    last == null || last.end >= 0 ? 'المتبقي' : 'المديونية',
+    last == null ? 0 : last.end.abs(),
+  ], bold: true);
+  addRow(['']);
+
+  addRow(['المرفقات (صور الفواتير)'], bold: true);
+  for (var i = 0; i < photos.length; i++) {
+    addRow([fmtDate(parseYmd(photos[i]['date'] as String)), 'فاتورة ${i + 1}']);
+  }
+  addRow(['']);
+
+  addRow(['المسؤول المالي'], bold: true);
+  addRow([username]);
+
+  final bytes = excel.encode() ?? <int>[];
+  final dir = await getTemporaryDirectory();
+  final file = File('${dir.path}/hisabati_${from}_$to.xlsx');
+  await file.writeAsBytes(bytes);
+  await Share.shareXFiles([XFile(file.path)], text: 'تقرير - البزي');
 }
 ===FILE: lib/core/kdf.dart ===
 import 'dart:convert';
@@ -1512,6 +1610,8 @@ class HomeTab extends StatelessWidget {
 }
 ===FILE: lib/screens/reports.dart ===
 import 'package:flutter/material.dart';
+import '../core/auth.dart';
+import '../core/export.dart';
 import '../core/ledger.dart';
 import '../core/store.dart';
 import '../core/util.dart';
@@ -1584,7 +1684,16 @@ class _ReportsTabState extends State<ReportsTab> {
                 : 'المديونية: ${money(-last.end)}';
 
         return Scaffold(
-          appBar: AppBar(title: const Text('التقارير')),
+          appBar: AppBar(
+            title: const Text('التقارير'),
+            actions: [
+              IconButton(
+                tooltip: 'تصدير إكسل',
+                icon: const Icon(Icons.table_chart_outlined),
+                onPressed: () => exportExcel(from: from, to: to, username: Auth.username),
+              ),
+            ],
+          ),
           body: ListView(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
             children: [
