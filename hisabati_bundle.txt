@@ -24,6 +24,7 @@ dependencies:
   encrypt: ^5.0.3
   crypto: ^3.0.3
   excel: ^4.0.6
+  pdf: ^3.11.1
 
 dev_dependencies:
   flutter_lints: ^3.0.0
@@ -330,6 +331,189 @@ Future<String> exportExcel({
   final dir = Directory('/storage/emulated/0/Download/التقارير');
   if (!await dir.exists()) await dir.create(recursive: true);
   final file = File('${dir.path}/${reportTitle(from, to)}.xlsx');
+  await file.writeAsBytes(bytes, flush: true);
+  return file.path;
+}
+===FILE: lib/core/export_pdf.dart ===
+import 'dart:convert';
+import 'dart:io';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'export.dart' show reportTitle;
+import 'ledger.dart';
+import 'store.dart';
+import 'util.dart';
+
+/// تصدير تقرير الفترة إلى PDF بصفحات A4، ويُحفظ في مجلد التقارير داخل التنزيلات.
+/// خط Cairo يُحمَّل تلقائياً من الإنترنت عند أول تصدير.
+Future<String> exportPdf({
+  required String from,
+  required String to,
+  required String username,
+}) async {
+  bool inRange(String d) => d.compareTo(from) >= 0 && d.compareTo(to) <= 0;
+
+  final rows = Ledger.build().where((r) => inRange(r.date)).toList();
+  final entries = Store.all('entries').where((e) => inRange(e['date'] as String)).toList()
+    ..sort((a, b) => (a['date'] as String).compareTo(b['date'] as String));
+  final photos = Store.all('attachments').where((a) => inRange(a['date'] as String)).toList()
+    ..sort((a, b) => (a['date'] as String).compareTo(b['date'] as String));
+
+  final received = rows.fold<int>(0, (s, r) => s + r.received);
+  final spent = rows.fold<int>(0, (s, r) => s + r.spent);
+  final last = rows.isEmpty ? null : rows.last;
+  final endValue = last == null ? 0 : last.end;
+
+  final regular = await PdfGoogleFonts.cairoRegular();
+  final bold = await PdfGoogleFonts.cairoBold();
+  final theme = pw.ThemeData.withFont(base: regular, bold: bold);
+
+  final green = PdfColor.fromHex('#1B8A5A');
+  final light = PdfColor.fromHex('#DDF1E7');
+  final grey = PdfColor.fromHex('#F1F1F1');
+  final red = PdfColor.fromHex('#C62828');
+  final lineColor = PdfColor.fromHex('#9E9E9E');
+
+  final content = <pw.Widget>[];
+
+  // الترويسة
+  content.add(pw.Center(
+    child: pw.Text('البزي',
+        style: pw.TextStyle(fontSize: 22, color: green, fontWeight: pw.FontWeight.bold)),
+  ));
+  content.add(pw.SizedBox(height: 4));
+  content.add(pw.Center(
+    child: pw.Text(reportTitle(from, to),
+        style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold)),
+  ));
+  content.add(pw.SizedBox(height: 10));
+
+  pw.Widget sectionBar(String title) => pw.Container(
+        width: double.infinity,
+        padding: const pw.EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        margin: const pw.EdgeInsets.only(top: 12, bottom: 6),
+        color: green,
+        child: pw.Text(title,
+            style: pw.TextStyle(color: PdfColors.white, fontSize: 13, fontWeight: pw.FontWeight.bold)),
+      );
+
+  pw.Widget totalLine(String label, int value, {PdfColor? color}) => pw.Container(
+        width: double.infinity,
+        padding: const pw.EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        color: grey,
+        child: pw.Text('$label: ${money(value)}',
+            textAlign: pw.TextAlign.right,
+            style: pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold, color: color)),
+      );
+
+  // أقسام الحركات
+  for (final kind in spendingKinds) {
+    final list = entries.where((e) => e['kind'] == kind).toList();
+    content.add(sectionBar(kindLabels[kind]!));
+    if (list.isEmpty) {
+      content.add(pw.Text('لا توجد حركات', style: const pw.TextStyle(fontSize: 10)));
+    } else {
+      content.add(pw.Table.fromTextArray(
+        headers: ['التاريخ', fieldLabels[kind]!, 'المبلغ', 'ملاحظة'],
+        data: [
+          for (final e in list)
+            [
+              e['date'] as String,
+              entryTitle(e),
+              money(amountOf(e)),
+              (e['note'] as String?) ?? '',
+            ],
+        ],
+        headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10),
+        headerDecoration: pw.BoxDecoration(color: light),
+        cellStyle: const pw.TextStyle(fontSize: 10),
+        cellAlignment: pw.Alignment.centerRight,
+        headerAlignment: pw.Alignment.center,
+        cellPadding: const pw.EdgeInsets.all(5),
+        border: pw.TableBorder.all(color: lineColor, width: 0.5),
+      ));
+      content.add(pw.SizedBox(height: 4));
+      content.add(totalLine('الإجمالي', sumOf(list)));
+    }
+  }
+
+  // الاستلام
+  final receivedList = entries.where((e) => e['kind'] == kindReceived).toList();
+  content.add(sectionBar('الاستلام'));
+  if (receivedList.isEmpty) {
+    content.add(pw.Text('لا يوجد استلام', style: const pw.TextStyle(fontSize: 10)));
+  } else {
+    content.add(pw.Table.fromTextArray(
+      headers: ['التاريخ', 'المبلغ'],
+      data: [
+        for (final e in receivedList) [e['date'] as String, money(amountOf(e))],
+      ],
+      headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10),
+      headerDecoration: pw.BoxDecoration(color: light),
+      cellStyle: const pw.TextStyle(fontSize: 10),
+      cellAlignment: pw.Alignment.centerRight,
+      headerAlignment: pw.Alignment.center,
+      cellPadding: const pw.EdgeInsets.all(5),
+      border: pw.TableBorder.all(color: lineColor, width: 0.5),
+    ));
+  }
+
+  // الملخص
+  content.add(sectionBar('الملخص'));
+  content.add(totalLine('إجمالي المستلم', received));
+  content.add(pw.SizedBox(height: 3));
+  content.add(totalLine('إجمالي المصروف', spent));
+  content.add(pw.SizedBox(height: 3));
+  content.add(totalLine(
+    endValue >= 0 ? 'المتبقي' : 'المديونية',
+    endValue.abs(),
+    color: endValue >= 0 ? green : red,
+  ));
+
+  // المرفقات: الصور كاملة في PDF
+  if (photos.isNotEmpty) {
+    content.add(sectionBar('المرفقات (صور الفواتير)'));
+    final images = <pw.Widget>[];
+    for (var i = 0; i < photos.length; i++) {
+      final bytes = base64Decode(photos[i]['photo'] as String);
+      images.add(pw.Column(
+        mainAxisSize: pw.MainAxisSize.min,
+        children: [
+          pw.Image(pw.MemoryImage(bytes), width: 230, fit: pw.BoxFit.contain),
+          pw.SizedBox(height: 3),
+          pw.Text('${photos[i]['date']}  -  فاتورة ${i + 1}',
+              style: const pw.TextStyle(fontSize: 9)),
+        ],
+      ));
+    }
+    content.add(pw.Wrap(spacing: 12, runSpacing: 12, children: images));
+  }
+
+  // التذييل
+  content.add(pw.SizedBox(height: 24));
+  content.add(pw.Divider(color: lineColor));
+  content.add(pw.Align(
+    alignment: pw.Alignment.centerRight,
+    child: pw.Text('المسؤول المالي',
+        style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold)),
+  ));
+  content.add(pw.Align(
+    alignment: pw.Alignment.centerRight,
+    child: pw.Text(username, style: const pw.TextStyle(fontSize: 11)),
+  ));
+
+  final doc = pw.Document(theme: theme);
+  doc.addPage(pw.MultiPage(
+    pageFormat: PdfPageFormat.a4,
+    margin: const pw.EdgeInsets.all(36),
+    textDirection: pw.TextDirection.rtl,
+    build: (context) => content,
+  ));
+
+  final bytes = await doc.save();
+  final dir = Directory('/storage/emulated/0/Download/التقارير');
+  if (!await dir.exists()) await dir.create(recursive: true);
+  final file = File('${dir.path}/${reportTitle(from, to)}.pdf');
   await file.writeAsBytes(bytes, flush: true);
   return file.path;
 }
@@ -1667,6 +1851,7 @@ class HomeTab extends StatelessWidget {
 import 'package:flutter/material.dart';
 import '../core/auth.dart';
 import '../core/export.dart';
+import '../core/export_pdf.dart';
 import '../core/ledger.dart';
 import '../core/store.dart';
 import '../core/util.dart';
@@ -1856,9 +2041,20 @@ class _ReportsTabState extends State<ReportsTab> {
                     child: OutlinedButton.icon(
                       icon: const Icon(Icons.picture_as_pdf_outlined),
                       label: const Text('تصدير إلى PDF'),
-                      onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('تصدير PDF يحتاج خط عربي (Cairo)، سيُفعَّل بعد رفعه')),
-                      ),
+                      onPressed: () async {
+                        String msg;
+                        try {
+                          final path = await exportPdf(from: from, to: to, username: Auth.username);
+                          msg = 'تم الحفظ في: $path';
+                        } catch (e) {
+                          msg = 'تعذّر تصدير PDF: $e';
+                        }
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text(msg), duration: const Duration(seconds: 10)),
+                          );
+                        }
+                      },
                     ),
                   ),
                 ],
