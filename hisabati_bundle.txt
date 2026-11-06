@@ -440,7 +440,7 @@ const kindLabels = {
 const fieldLabels = {
   kindExpense: 'الاسم',
   kindPurchase: 'الصنف',
-  kindTransport: 'التفاصيل',
+  kindTransport: 'الاسم',
 };
 
 const currencyName = 'ريال';
@@ -1298,7 +1298,9 @@ Future<void> openEntrySheet(
                   const SizedBox(height: 12),
                   TextField(
                     controller: note,
-                    decoration: const InputDecoration(labelText: 'ملاحظة (اختياري)'),
+                    decoration: InputDecoration(
+                      labelText: kind == kindTransport ? 'التفاصيل (اختياري)' : 'ملاحظة (اختياري)',
+                    ),
                   ),
                   const SizedBox(height: 18),
                   FilledButton(
