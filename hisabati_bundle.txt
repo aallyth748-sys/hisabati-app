@@ -25,6 +25,7 @@ dependencies:
   crypto: ^3.0.3
   excel: ^4.0.6
   pdf: ^3.11.1
+  printing: ^5.12.0
 
 dev_dependencies:
   flutter_lints: ^3.0.0
@@ -338,6 +339,7 @@ Future<String> exportExcel({
 import 'dart:convert';
 import 'dart:io';
 import 'package:pdf/pdf.dart';
+import 'package:printing/printing.dart' show PdfGoogleFonts;
 import 'package:pdf/widgets.dart' as pw;
 import 'export.dart' show reportTitle;
 import 'ledger.dart';
