@@ -1696,29 +1696,7 @@ class _ReportsTabState extends State<ReportsTab> {
                 : 'المديونية: ${money(-last.end)}';
 
         return Scaffold(
-          appBar: AppBar(
-            title: const Text('التقارير'),
-            actions: [
-              IconButton(
-                tooltip: 'تصدير إكسل',
-                icon: const Icon(Icons.table_chart_outlined),
-                onPressed: () async {
-                  String msg;
-                  try {
-                    final path = await exportExcel(from: from, to: to, username: Auth.username);
-                    msg = 'تم الحفظ في: $path';
-                  } catch (e) {
-                    msg = 'تعذّر الحفظ: $e';
-                  }
-                  if (context.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(msg), duration: const Duration(seconds: 10)),
-                    );
-                  }
-                },
-              ),
-            ],
-          ),
+          appBar: AppBar(title: const Text('التقارير')),
           body: ListView(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
             children: [
@@ -1807,6 +1785,41 @@ class _ReportsTabState extends State<ReportsTab> {
               if (rows.isEmpty)
                 const AppCard(child: Center(child: Text('لا توجد حركات في هذه الفترة'))),
               for (final r in rows.reversed) _dayRow(context, r),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      icon: const Icon(Icons.table_chart_outlined),
+                      label: const Text('تصدير إلى إكسيل'),
+                      onPressed: () async {
+                        String msg;
+                        try {
+                          final path = await exportExcel(from: from, to: to, username: Auth.username);
+                          msg = 'تم الحفظ في: $path';
+                        } catch (e) {
+                          msg = 'تعذّر الحفظ: $e';
+                        }
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text(msg), duration: const Duration(seconds: 10)),
+                          );
+                        }
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.picture_as_pdf_outlined),
+                      label: const Text('تصدير إلى PDF'),
+                      onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('تصدير PDF يحتاج خط عربي (Cairo)، سيُفعَّل بعد رفعه')),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ],
           ),
         );
