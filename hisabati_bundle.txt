@@ -201,7 +201,7 @@ String reportFileName(String from, String to) {
 
 /// تصدير تقرير الفترة إلى ملف إكسل يُحفظ مباشرة في تنزيلات الهاتف.
 /// المرفقات تظهر هنا بأسمائها ومواضعها فقط، والصور الكاملة في ملف PDF.
-Future<void> exportExcel({
+Future<String> exportExcel({
   required String from,
   required String to,
   required String username,
@@ -282,7 +282,8 @@ Future<void> exportExcel({
   addRow([username]);
 
   final bytes = Uint8List.fromList(excel.encode() ?? <int>[]);
-  await FileSaver.instance.saveFile(
+  if (bytes.isEmpty) throw StateError('الملف فارغ');
+  return FileSaver.instance.saveFile(
     name: reportFileName(from, to),
     bytes: bytes,
     ext: 'xlsx',
@@ -1702,10 +1703,16 @@ class _ReportsTabState extends State<ReportsTab> {
                 tooltip: 'تصدير إكسل',
                 icon: const Icon(Icons.table_chart_outlined),
                 onPressed: () async {
-                  await exportExcel(from: from, to: to, username: Auth.username);
+                  String msg;
+                  try {
+                    final path = await exportExcel(from: from, to: to, username: Auth.username);
+                    msg = 'تم الحفظ في: $path';
+                  } catch (e) {
+                    msg = 'تعذّر الحفظ: $e';
+                  }
                   if (context.mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('تم حفظ ملف الإكسل في تنزيلات الهاتف')),
+                      SnackBar(content: Text(msg), duration: const Duration(seconds: 10)),
                     );
                   }
                 },
