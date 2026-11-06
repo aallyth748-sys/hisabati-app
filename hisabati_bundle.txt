@@ -1,0 +1,2033 @@
+===FILE: pubspec.yaml ===
+name: hisabati
+description: البزي - تتبع النفقات والمشتريات والمواصلات والاستلام
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.19.0
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  flutter_secure_storage: ^9.2.2
+  image_picker: ^1.1.2
+  url_launcher: ^6.3.0
+  share_plus: ^10.0.0
+  file_picker: ^8.1.2
+  path_provider: ^2.1.4
+  encrypt: ^5.0.3
+  crypto: ^3.0.3
+
+dev_dependencies:
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+===FILE: lib/core/auth.dart ===
+import 'dart:convert';
+import 'dart:math';
+import 'package:flutter/foundation.dart';
+import 'kdf.dart';
+import 'store.dart';
+
+/// الحساب المحلي: اسم المستخدم وكلمة المرور تُحفظ داخل قاعدة البيانات المشفّرة.
+/// كلمة المرور لا تُحفظ كنص، بل بصمة مشتقة منها مع ملح عشوائي.
+class Auth {
+  Auth._();
+
+  static const minPassword = 4;
+  static const minUsername = 2;
+
+  /// حالة الدخول الحالية. تُعاد إلى false عند فتح التطبيق، فيُطلب تسجيل الدخول في كل مرة.
+  static final ValueNotifier<bool> session = ValueNotifier(false);
+
+  static Map<String, dynamic>? get _account {
+    final raw = Store.setting<Object?>('account', null);
+    if (raw is! Map) return null;
+    return Map<String, dynamic>.from(raw);
+  }
+
+  static bool get hasAccount => _account != null;
+  static bool get isLoggedIn => hasAccount && session.value;
+  static String get username => (_account?['username'] as String?) ?? '';
+
+  static Map<String, dynamic> _make(String username, String password) {
+    final rnd = Random.secure();
+    final salt = List<int>.generate(16, (_) => rnd.nextInt(256));
+    return {
+      'username': username,
+      'salt': base64Encode(salt),
+      'hash': base64Encode(deriveKey(password, salt)),
+    };
+  }
+
+  static bool _verify(Map<String, dynamic> acc, String password) {
+    final salt = base64Decode(acc['salt'] as String);
+    final expected = base64Decode(acc['hash'] as String);
+    final actual = deriveKey(password, salt);
+    if (actual.length != expected.length) return false;
+    var diff = 0;
+    for (var i = 0; i < actual.length; i++) {
+      diff |= actual[i] ^ expected[i];
+    }
+    return diff == 0;
+  }
+
+  static Future<void> createAccount(String username, String password) =>
+      Store.setSetting('account', _make(username, password));
+
+  /// يتحقق من البيانات ويفتح الجلسة. يعيد false إذا كانت البيانات خاطئة.
+  static bool login(String username, String password) {
+    final acc = _account;
+    if (acc == null) return false;
+    if (acc['username'] != username || !_verify(acc, password)) return false;
+    session.value = true;
+    return true;
+  }
+
+  static bool checkPassword(String password) {
+    final acc = _account;
+    return acc != null && _verify(acc, password);
+  }
+
+  static Future<void> changeUsername(String username) async {
+    final acc = _account;
+    if (acc == null) return;
+    acc['username'] = username;
+    await Store.setSetting('account', acc);
+  }
+
+  static Future<void> changePassword(String newPassword) async {
+    final acc = _account;
+    if (acc == null) return;
+    final fresh = _make(acc['username'] as String, newPassword);
+    await Store.setSetting('account', fresh);
+  }
+
+  static void logout() {
+    session.value = false;
+  }
+}
+===FILE: lib/core/backup.dart ===
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'package:encrypt/encrypt.dart' as enc;
+import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'kdf.dart';
+import 'store.dart';
+
+/// النسخ الاحتياطي: ملف مشفّر بكلمة مرور يحدّدها المستخدم، ويُستعاد بها.
+class Backup {
+  Backup._();
+
+  static const _format = 'hisabati-backup';
+
+  static String _encrypt(String plain, String password) {
+    final rnd = Random.secure();
+    final salt = List<int>.generate(16, (_) => rnd.nextInt(256));
+    final key = enc.Key(deriveKey(password, salt));
+    final iv = enc.IV.fromSecureRandom(16);
+    final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.cbc));
+    final encrypted = encrypter.encrypt(plain, iv: iv);
+    return jsonEncode({
+      'format': _format,
+      'version': 1,
+      'salt': base64Encode(salt),
+      'iv': iv.base64,
+      'data': encrypted.base64,
+    });
+  }
+
+  /// يعيد النص الأصلي، ويرمي خطأ إذا كانت كلمة المرور خاطئة أو الملف تالفاً.
+  static String decrypt(String fileText, String password) {
+    final map = jsonDecode(fileText) as Map<String, dynamic>;
+    if (map['format'] != _format) {
+      throw const FormatException('ملف غير صالح');
+    }
+    final salt = base64Decode(map['salt'] as String);
+    final key = enc.Key(deriveKey(password, salt));
+    final iv = enc.IV.fromBase64(map['iv'] as String);
+    final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.cbc));
+    return encrypter.decrypt64(map['data'] as String, iv: iv);
+  }
+
+  /// ينشئ ملف النسخة ثم يفتح قائمة المشاركة (حفظ أو إرسال).
+  static Future<void> exportFile(String password) async {
+    final text = _encrypt(jsonEncode(Store.exportData()), password);
+    final dir = await getTemporaryDirectory();
+    final file = File('${dir.path}/hisabati_${DateTime.now().millisecondsSinceEpoch}.hbak');
+    await file.writeAsString(text);
+    await Share.shareXFiles(
+      [XFile(file.path)],
+      text: 'نسخة احتياطية - البزي',
+    );
+  }
+
+  /// يختار ملف النسخة من الهاتف ويعيد نصه، أو null إذا ألغى المستخدم.
+  static Future<String?> pickFileText() async {
+    final result = await FilePicker.platform.pickFiles(type: FileType.any);
+    final path = result?.files.single.path;
+    if (path == null) return null;
+    return File(path).readAsString();
+  }
+}
+===FILE: lib/core/kdf.dart ===
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:crypto/crypto.dart';
+
+/// اشتقاق المفتاح من كلمة المرور (PBKDF2-HMAC-SHA256، 20000 تكرار).
+/// يُستخدم لتشفير النسخ الاحتياطية، ولتخزين كلمة مرور الحساب بشكل آمن.
+Uint8List deriveKey(String password, List<int> salt) {
+  const iterations = 20000;
+  final hmac = Hmac(sha256, utf8.encode(password));
+  var block = hmac.convert([...salt, 0, 0, 0, 1]).bytes;
+  final result = List<int>.from(block);
+  for (var i = 1; i < iterations; i++) {
+    block = hmac.convert(block).bytes;
+    for (var j = 0; j < result.length; j++) {
+      result[j] ^= block[j];
+    }
+  }
+  return Uint8List.fromList(result);
+}
+===FILE: lib/core/ledger.dart ===
+import 'store.dart';
+import 'util.dart';
+
+/// سطر يوم واحد في الحساب.
+class DayRow {
+  const DayRow({
+    required this.date,
+    required this.start,
+    required this.received,
+    required this.spent,
+    required this.end,
+  });
+
+  final String date;
+
+  /// الرصيد بداية اليوم، بعد إضافة ما استُلم فيه.
+  final int start;
+  final int received;
+  final int spent;
+
+  /// الرصيد نهاية اليوم، وقد يكون سالباً.
+  final int end;
+
+  int get remaining => end > 0 ? end : 0;
+  int get debt => end < 0 ? -end : 0;
+}
+
+class Ledger {
+  Ledger._();
+
+  /// يحسب الرصيد يوماً بيوم:
+  /// بداية اليوم = رصيد السابق + المستلم، ونهايته = البداية - المصروف.
+  /// الأيام التي لا حركة فيها لا تظهر، ويستمر الرصيد عبرها.
+  /// إذا صار الرصيد سالباً فهذه مديونية، ويُسدَّد الدَّين أولاً من أي استلام لاحق.
+  static List<DayRow> build() {
+    final byDate = <String, List<Map<String, dynamic>>>{};
+    for (final e in Store.all('entries')) {
+      byDate.putIfAbsent(e['date'] as String, () => []).add(e);
+    }
+    final dates = byDate.keys.toList()..sort();
+
+    final rows = <DayRow>[];
+    var balance = 0;
+    for (final d in dates) {
+      final list = byDate[d]!;
+      final received = sumOf(list.where((e) => e['kind'] == kindReceived));
+      final spent = sumOf(list.where((e) => e['kind'] != kindReceived));
+      final start = balance + received;
+      final end = start - spent;
+      rows.add(DayRow(
+        date: d,
+        start: start,
+        received: received,
+        spent: spent,
+        end: end,
+      ));
+      balance = end;
+    }
+    return rows;
+  }
+
+  /// الرصيد الحالي: آخر نهاية يوم، أو صفر إذا لا توجد حركات.
+  static int currentBalance(List<DayRow> rows) => rows.isEmpty ? 0 : rows.last.end;
+}
+===FILE: lib/core/store.dart ===
+import 'dart:convert';
+import 'dart:math';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+
+/// طبقة التخزين: قاعدة Hive مشفّرة، ومفتاحها محفوظ في مخزن الجهاز الآمن.
+class Store {
+  Store._();
+
+  static const _keyAlias = 'hisabati_db_key';
+  static const backupKeys = ['entries', 'attachments'];
+  static late Box<Map> _box;
+
+  static Future<void> init() async {
+    await Hive.initFlutter();
+    const secure = FlutterSecureStorage();
+    var encoded = await secure.read(key: _keyAlias);
+    if (encoded == null) {
+      final rnd = Random.secure();
+      encoded = base64Encode(List<int>.generate(32, (_) => rnd.nextInt(256)));
+      await secure.write(key: _keyAlias, value: encoded);
+    }
+    _box = await Hive.openBox<Map>(
+      'hisabati_db',
+      encryptionCipher: HiveAesCipher(base64Decode(encoded)),
+    );
+  }
+
+  static ValueListenable<Box<Map>> get listenable => _box.listenable();
+
+  static String newId() =>
+      DateTime.now().microsecondsSinceEpoch.toRadixString(36) +
+      Random().nextInt(9999).toString();
+
+  // ---------- الإعدادات ----------
+  static Map<String, dynamic> get _settings =>
+      Map<String, dynamic>.from(_box.get('settings') ?? {});
+
+  static T setting<T>(String key, T fallback) =>
+      (_settings[key] as T?) ?? fallback;
+
+  static Future<void> setSetting(String key, dynamic value) async {
+    final s = _settings;
+    s[key] = value;
+    await _box.put('settings', s);
+  }
+
+  static ThemeMode get themeMode {
+    switch (setting<String>('theme', 'dark')) {
+      case 'light':
+        return ThemeMode.light;
+      case 'system':
+        return ThemeMode.system;
+      default:
+        return ThemeMode.dark;
+    }
+  }
+
+  // ---------- القوائم ----------
+  static List<Map<String, dynamic>> all(String key) {
+    final raw = _box.get(key);
+    if (raw == null) return [];
+    return (raw['items'] as List)
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+  }
+
+  static Future<void> upsert(String key, Map<String, dynamic> item) async {
+    final items = all(key);
+    final i = items.indexWhere((e) => e['id'] == item['id']);
+    if (i >= 0) {
+      items[i] = item;
+    } else {
+      items.add(item);
+    }
+    await _box.put(key, {'items': items});
+  }
+
+  static Future<void> remove(String key, String id) async {
+    final items = all(key)..removeWhere((e) => e['id'] == id);
+    await _box.put(key, {'items': items});
+  }
+
+  static Future<void> wipe() => _box.clear();
+
+  // ---------- النسخ الاحتياطي ----------
+  static Map<String, dynamic> exportData() => {
+        'version': 1,
+        'settings': _settings,
+        for (final key in backupKeys) key: all(key),
+      };
+
+  static Future<void> restore(Map<String, dynamic> data) async {
+    await _box.clear();
+    final settingsData = data['settings'];
+    if (settingsData is Map) {
+      await _box.put('settings', Map<String, dynamic>.from(settingsData));
+    }
+    for (final key in backupKeys) {
+      final items = data[key];
+      await _box.put(key, {'items': items is List ? items : []});
+    }
+  }
+}
+===FILE: lib/core/theme.dart ===
+import 'package:flutter/material.dart';
+
+/// ألوان التطبيق وأشكاله (أخضر مالي هادئ).
+class AppTheme {
+  AppTheme._();
+
+  static const accent = Color(0xFF1B8A5A);
+
+  static ThemeData light() => _build(Brightness.light);
+  static ThemeData dark() => _build(Brightness.dark);
+
+  static ThemeData _build(Brightness brightness) {
+    final isDark = brightness == Brightness.dark;
+    final scheme = ColorScheme.fromSeed(seedColor: accent, brightness: brightness);
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: scheme,
+      scaffoldBackgroundColor: isDark ? const Color(0xFF0F1714) : const Color(0xFFF2F7F4),
+      appBarTheme: AppBarTheme(
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        backgroundColor: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+        titleTextStyle: TextStyle(
+          fontSize: 22,
+          fontWeight: FontWeight.w900,
+          color: scheme.onSurface,
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: isDark ? const Color(0xFF1E2A25) : const Color(0xFFF6FAF8),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: BorderSide.none,
+        ),
+      ),
+      navigationBarTheme: const NavigationBarThemeData(
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+      ),
+    );
+  }
+}
+===FILE: lib/core/util.dart ===
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'store.dart';
+
+const kindExpense = 'expense';
+const kindPurchase = 'purchase';
+const kindTransport = 'transport';
+const kindReceived = 'received';
+
+const spendingKinds = [kindExpense, kindPurchase, kindTransport];
+
+const kindLabels = {
+  kindExpense: 'النفقات',
+  kindPurchase: 'المشتريات',
+  kindTransport: 'المواصلات',
+  kindReceived: 'الاستلام',
+};
+
+/// اسم الحقل الخاص بكل قسم.
+const fieldLabels = {
+  kindExpense: 'الاسم',
+  kindPurchase: 'الصنف',
+  kindTransport: 'التفاصيل',
+};
+
+const currencyName = 'ريال';
+
+const _weekdayNames = ['الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];
+
+String ymd(DateTime d) => DateFormat('yyyy-MM-dd').format(d);
+
+DateTime parseYmd(String s) => DateTime.parse(s);
+
+String fmtDate(DateTime d) => DateFormat('yyyy/MM/dd').format(d);
+
+String dayName(DateTime d) => _weekdayNames[d.weekday % 7];
+
+String money(int v) => '${NumberFormat('#,##0').format(v)} $currencyName';
+
+String entryTitle(Map<String, dynamic> e) {
+  final kind = e['kind'] as String;
+  if (kind == kindReceived) return 'استلام';
+  final t = (e['title'] as String?) ?? '';
+  return t.isEmpty ? kindLabels[kind]! : t;
+}
+
+IconData kindIcon(String kind) {
+  switch (kind) {
+    case kindPurchase:
+      return Icons.shopping_bag_outlined;
+    case kindTransport:
+      return Icons.directions_bus_outlined;
+    case kindReceived:
+      return Icons.south_west;
+    default:
+      return Icons.receipt_long;
+  }
+}
+
+int amountOf(Map<String, dynamic> e) => (e['amount'] as num).toInt();
+
+/// مجموع المبالغ في قائمة من الحركات.
+int sumOf(Iterable<Map<String, dynamic>> list) =>
+    list.fold<int>(0, (s, e) => s + amountOf(e));
+
+/// الحركات الخاصة بيوم معيّن.
+List<Map<String, dynamic>> entriesOn(String date) =>
+    Store.all('entries').where((e) => e['date'] == date).toList();
+===FILE: lib/core/widgets.dart ===
+import 'package:flutter/material.dart';
+
+/// بطاقة موحدة بزوايا دائرية.
+class AppCard extends StatelessWidget {
+  const AppCard({
+    super.key,
+    required this.child,
+    this.onTap,
+    this.padding = const EdgeInsets.all(16),
+  });
+
+  final Widget child;
+  final VoidCallback? onTap;
+  final EdgeInsets padding;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF17231E) : Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: theme.colorScheme.outline.withOpacity(0.15)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(isDark ? 0.3 : 0.05),
+            blurRadius: 20,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(20),
+          onTap: onTap,
+          child: Padding(padding: padding, child: child),
+        ),
+      ),
+    );
+  }
+}
+
+/// عنوان قسم داخل الشاشة.
+class SectionTitle extends StatelessWidget {
+  const SectionTitle(this.text, {super.key});
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 14, 4, 8),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.w800,
+          color: Theme.of(context).colorScheme.primary,
+        ),
+      ),
+    );
+  }
+}
+
+/// مربع إحصائية صغير.
+class StatTile extends StatelessWidget {
+  const StatTile({super.key, required this.value, required this.label});
+  final String value;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return AppCard(
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
+      child: Column(
+        children: [
+          Text(
+            value,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w900,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(label, textAlign: TextAlign.center, style: const TextStyle(fontSize: 13)),
+        ],
+      ),
+    );
+  }
+}
+===FILE: lib/main.dart ===
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'core/auth.dart';
+import 'core/store.dart';
+import 'core/theme.dart';
+import 'screens/auth_screen.dart';
+import 'shell.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Store.init();
+  runApp(const HisabatiApp());
+}
+
+class HisabatiApp extends StatelessWidget {
+  const HisabatiApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder(
+      valueListenable: Store.listenable,
+      builder: (context, value, child) {
+        return MaterialApp(
+          title: 'البزي',
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.light(),
+          darkTheme: AppTheme.dark(),
+          themeMode: Store.themeMode,
+          locale: const Locale('ar'),
+          supportedLocales: const [Locale('ar')],
+          localizationsDelegates: const [
+            GlobalMaterialLocalizations.delegate,
+            GlobalWidgetsLocalizations.delegate,
+            GlobalCupertinoLocalizations.delegate,
+          ],
+          builder: (context, child) => Directionality(
+            textDirection: TextDirection.rtl,
+            child: child ?? const SizedBox.shrink(),
+          ),
+          home: const _AppGate(),
+        );
+      },
+    );
+  }
+}
+
+/// بوابة الدخول: تعرض شاشة الدخول حتى يسجّل المستخدم، ثم التطبيق.
+class _AppGate extends StatelessWidget {
+  const _AppGate();
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: Listenable.merge([Auth.session, Store.listenable]),
+      builder: (context, _) =>
+          Auth.isLoggedIn ? const AppShell() : const AuthScreen(),
+    );
+  }
+}
+===FILE: lib/screens/auth_screen.dart ===
+import 'package:flutter/material.dart';
+import '../core/auth.dart';
+import '../core/widgets.dart';
+
+/// شاشة الدخول وإنشاء الحساب. تظهر عند كل فتح للتطبيق.
+class AuthScreen extends StatefulWidget {
+  const AuthScreen({super.key});
+
+  @override
+  State<AuthScreen> createState() => _AuthScreenState();
+}
+
+class _AuthScreenState extends State<AuthScreen> {
+  final _user = TextEditingController();
+  final _pass = TextEditingController();
+  final _pass2 = TextEditingController();
+  bool _creating = false;
+  String? _error;
+
+  void _login() {
+    final u = _user.text.trim();
+    if (!Auth.hasAccount) {
+      setState(() => _error = 'لا يوجد حساب على هذا الجهاز، أنشئ حساباً جديداً');
+      return;
+    }
+    if (!Auth.login(u, _pass.text)) {
+      setState(() => _error = 'اسم المستخدم أو كلمة المرور غير صحيحة');
+    }
+    // عند النجاح تتبدّل الشاشة تلقائياً عبر AppGate.
+  }
+
+  Future<void> _create() async {
+    final u = _user.text.trim();
+    final p = _pass.text;
+    String? err;
+    if (u.length < Auth.minUsername) {
+      err = 'اسم المستخدم يجب أن يكون حرفين على الأقل';
+    } else if (p.length < Auth.minPassword) {
+      err = 'كلمة المرور يجب أن تكون 4 أحرف على الأقل';
+    } else if (p != _pass2.text) {
+      err = 'كلمتا المرور غير متطابقتين';
+    }
+    if (err != null) {
+      setState(() => _error = err);
+      return;
+    }
+    await Auth.createAccount(u, p);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('تم إنشاء الحساب'),
+        content: Text('يمكنك الآن تسجيل الدخول باسم: $u'),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('موافق'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    setState(() {
+      _creating = false;
+      _user.text = u;
+      _pass.clear();
+      _pass2.clear();
+      _error = null;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final creating = _creating && !Auth.hasAccount;
+    return Scaffold(
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(24),
+          children: [
+            const SizedBox(height: 40),
+            Icon(Icons.account_balance_wallet_outlined,
+                size: 64, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(height: 12),
+            Text(
+              creating ? 'إنشاء حساب جديد' : 'قم بتسجيل الدخول',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 24),
+            TextField(
+              controller: _user,
+              decoration: const InputDecoration(labelText: 'اسم المستخدم'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _pass,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'كلمة المرور'),
+            ),
+            if (creating) ...[
+              const SizedBox(height: 12),
+              TextField(
+                controller: _pass2,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'أعد كتابة كلمة المرور'),
+              ),
+            ],
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Text(_error!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.red)),
+              ),
+            const SizedBox(height: 20),
+            FilledButton(
+              onPressed: creating ? _create : _login,
+              child: Text(creating ? 'تم' : 'تسجيل الدخول'),
+            ),
+            const SizedBox(height: 8),
+            if (!Auth.hasAccount)
+              TextButton(
+                onPressed: () => setState(() {
+                  _creating = !_creating;
+                  _error = null;
+                }),
+                child: Text(creating
+                    ? 'لديّ حساب، تسجيل الدخول'
+                    : 'ليس لديك حساب؟ إنشاء حساب جديد'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// نافذة تغيير اسم المستخدم، بعد التحقق من كلمة المرور الحالية.
+Future<void> openChangeUsername(BuildContext context) async {
+  final name = TextEditingController(text: Auth.username);
+  final pass = TextEditingController();
+  String? error;
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setDialog) => AlertDialog(
+        title: const Text('تغيير اسم المستخدم'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: name,
+              decoration: const InputDecoration(labelText: 'اسم المستخدم الجديد'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: pass,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'كلمة المرور الحالية'),
+            ),
+            if (error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Text(error!, style: const TextStyle(color: Colors.red)),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+          FilledButton(
+            onPressed: () async {
+              final n = name.text.trim();
+              if (n.length < Auth.minUsername) {
+                setDialog(() => error = 'اسم المستخدم يجب أن يكون حرفين على الأقل');
+                return;
+              }
+              if (!Auth.checkPassword(pass.text)) {
+                setDialog(() => error = 'كلمة المرور الحالية غير صحيحة');
+                return;
+              }
+              await Auth.changeUsername(n);
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('حفظ'),
+          ),
+        ],
+      ),
+    ),
+  );
+  if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('تم تحديث البيانات إن كانت قد تغيّرت')),
+    );
+  }
+}
+
+/// نافذة تغيير كلمة المرور، بعد التحقق من كلمة المرور الحالية.
+Future<void> openChangePassword(BuildContext context) async {
+  final current = TextEditingController();
+  final next = TextEditingController();
+  final confirm = TextEditingController();
+  String? error;
+  bool saved = false;
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setDialog) => AlertDialog(
+        title: const Text('تغيير كلمة المرور'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: current,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'كلمة المرور الحالية'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: next,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'كلمة المرور الجديدة'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: confirm,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'أعد كتابة كلمة المرور الجديدة'),
+            ),
+            if (error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Text(error!, style: const TextStyle(color: Colors.red)),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+          FilledButton(
+            onPressed: () async {
+              if (!Auth.checkPassword(current.text)) {
+                setDialog(() => error = 'كلمة المرور الحالية غير صحيحة');
+                return;
+              }
+              if (next.text.length < Auth.minPassword) {
+                setDialog(() => error = 'كلمة المرور الجديدة يجب أن تكون 4 أحرف على الأقل');
+                return;
+              }
+              if (next.text != confirm.text) {
+                setDialog(() => error = 'كلمتا المرور غير متطابقتين');
+                return;
+              }
+              await Auth.changePassword(next.text);
+              saved = true;
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('حفظ'),
+          ),
+        ],
+      ),
+    ),
+  );
+  if (saved && context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('تم تغيير كلمة المرور')),
+    );
+  }
+}
+===FILE: lib/screens/backup_screen.dart ===
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import '../core/backup.dart';
+import '../core/store.dart';
+import '../core/widgets.dart';
+
+/// يطلب كلمة مرور من المستخدم. عند الإنشاء يطلب تأكيدها.
+Future<String?> _askPassword(BuildContext context, {required String title, bool confirm = false}) {
+  final first = TextEditingController();
+  final second = TextEditingController();
+  String? error;
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setDialog) => AlertDialog(
+        title: Text(title),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: first,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'كلمة المرور'),
+            ),
+            if (confirm) ...[
+              const SizedBox(height: 10),
+              TextField(
+                controller: second,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'أعد كتابة كلمة المرور'),
+              ),
+            ],
+            if (error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Text(error!, style: const TextStyle(color: Colors.red)),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+          FilledButton(
+            onPressed: () {
+              final p = first.text;
+              if (p.length < 4) {
+                setDialog(() => error = 'كلمة المرور يجب أن تكون 4 أحرف على الأقل');
+                return;
+              }
+              if (confirm && p != second.text) {
+                setDialog(() => error = 'كلمتا المرور غير متطابقتين');
+                return;
+              }
+              Navigator.pop(ctx, p);
+            },
+            child: const Text('تأكيد'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class BackupScreen extends StatelessWidget {
+  const BackupScreen({super.key});
+
+  void _message(BuildContext context, String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future<void> _export(BuildContext context) async {
+    final password = await _askPassword(
+      context,
+      title: 'كلمة مرور النسخة',
+      confirm: true,
+    );
+    if (password == null) return;
+    try {
+      await Backup.exportFile(password);
+    } catch (_) {
+      if (context.mounted) _message(context, 'تعذّر إنشاء النسخة الاحتياطية');
+    }
+  }
+
+  Future<void> _import(BuildContext context) async {
+    final text = await Backup.pickFileText();
+    if (text == null || !context.mounted) return;
+    final password = await _askPassword(context, title: 'كلمة مرور النسخة');
+    if (password == null || !context.mounted) return;
+
+    Map<String, dynamic> data;
+    try {
+      final plain = Backup.decrypt(text, password);
+      data = Map<String, dynamic>.from(jsonDecode(plain) as Map);
+    } catch (_) {
+      if (context.mounted) {
+        _message(context, 'كلمة المرور غير صحيحة، أو الملف تالف');
+      }
+      return;
+    }
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('استعادة النسخة؟'),
+        content: const Text('ستُستبدل البيانات الحالية ببيانات النسخة.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('استعادة')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    await Store.restore(data);
+    if (context.mounted) {
+      _message(context, 'تمت استعادة البيانات بنجاح');
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('النسخ الاحتياطي')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const SectionTitle('إنشاء نسخة'),
+          AppCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'تنشئ ملفاً مشفّراً بكلمة مرور تحددها أنت. احفظه في مكان آمن، أو أرسله لنفسك، ليمكنك استعادته على أي هاتف.',
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  icon: const Icon(Icons.save_alt),
+                  label: const Text('إنشاء نسخة احتياطية'),
+                  onPressed: () => _export(context),
+                ),
+              ],
+            ),
+          ),
+          const SectionTitle('استعادة نسخة'),
+          AppCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('اختر ملف النسخة من الهاتف، ثم أدخل كلمة المرور التي حددتها عند إنشائها.'),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.upload_file),
+                  label: const Text('استعادة من ملف'),
+                  onPressed: () => _import(context),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+===FILE: lib/screens/day_detail.dart ===
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import '../core/store.dart';
+import '../core/util.dart';
+import '../core/widgets.dart';
+import 'entry_sheet.dart';
+
+Future<String?> _pickPhoto() async {
+  final file = await ImagePicker().pickImage(
+    source: ImageSource.gallery,
+    maxWidth: 1024,
+    maxHeight: 1024,
+    imageQuality: 70,
+  );
+  if (file == null) return null;
+  return base64Encode(await file.readAsBytes());
+}
+
+/// تفاصيل يوم: حركاته، ومرفقات الصور الخاصة به.
+Future<void> openDayDetail(BuildContext context, String date) async {
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (sheetContext) {
+      return ValueListenableBuilder(
+        valueListenable: Store.listenable,
+        builder: (context, box, child) {
+          final entries = entriesOn(date);
+          final photos = Store.all('attachments').where((a) => a['date'] == date).toList();
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    '${dayName(parseYmd(date))} ${fmtDate(parseYmd(date))}',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+                  ),
+                  const SectionTitle('الحركات'),
+                  if (entries.isEmpty)
+                    const Center(child: Text('لا توجد حركات في هذا اليوم'))
+                  else
+                    for (final e in entries) entryCard(context, e),
+                  const SectionTitle('المرفقات (صور الفواتير)'),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final p in photos)
+                        GestureDetector(
+                          onLongPress: () async {
+                            await Store.remove('attachments', p['id'] as String);
+                          },
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: Image.memory(
+                              base64Decode(p['photo'] as String),
+                              width: 96,
+                              height: 96,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                        ),
+                      OutlinedButton.icon(
+                        icon: const Icon(Icons.add_a_photo_outlined),
+                        label: const Text('إضافة صورة'),
+                        onPressed: () async {
+                          final photo = await _pickPhoto();
+                          if (photo == null) return;
+                          await Store.upsert('attachments', {
+                            'id': Store.newId(),
+                            'date': date,
+                            'photo': photo,
+                          });
+                        },
+                      ),
+                    ],
+                  ),
+                  if (photos.isNotEmpty)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 8),
+                      child: Text(
+                        'اضغط مطولاً على الصورة لحذفها',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    },
+  );
+}
+===FILE: lib/screens/entry_sheet.dart ===
+import 'package:flutter/material.dart';
+import '../core/ledger.dart';
+import '../core/store.dart';
+import '../core/util.dart';
+import '../core/widgets.dart';
+
+/// بطاقة حركة واحدة. الضغط عليها يفتح تعديلها.
+Widget entryCard(BuildContext context, Map<String, dynamic> e) {
+  final kind = e['kind'] as String;
+  final note = (e['note'] as String?) ?? '';
+  final color = kind == kindReceived
+      ? Colors.green
+      : Theme.of(context).colorScheme.primary;
+  return AppCard(
+    onTap: () => openEntrySheet(context, kind: kind, existing: e),
+    child: Row(
+      children: [
+        CircleAvatar(
+          radius: 20,
+          backgroundColor: color.withOpacity(0.15),
+          child: Icon(kindIcon(kind), color: color, size: 20),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                entryTitle(e),
+                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
+              ),
+              if (note.isNotEmpty)
+                Text(
+                  note,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+            ],
+          ),
+        ),
+        Text(
+          money(amountOf(e)),
+          style: TextStyle(fontWeight: FontWeight.w900, color: color),
+        ),
+      ],
+    ),
+  );
+}
+
+/// نافذة إضافة حركة أو تعديلها. الاستلام لا يحتاج اسماً.
+Future<void> openEntrySheet(
+  BuildContext context, {
+  required String kind,
+  Map<String, dynamic>? existing,
+}) async {
+  var date = (existing?['date'] as String?) ?? ymd(DateTime.now());
+  final amount = TextEditingController(
+    text: existing == null ? '' : amountOf(existing).toString(),
+  );
+  final title = TextEditingController(text: (existing?['title'] as String?) ?? '');
+  final note = TextEditingController(text: (existing?['note'] as String?) ?? '');
+  final isReceived = kind == kindReceived;
+
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (sheetContext) {
+      return StatefulBuilder(
+        builder: (sheetContext, setSheet) {
+          return Padding(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              0,
+              20,
+              MediaQuery.of(sheetContext).viewInsets.bottom + 20,
+            ),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    existing == null
+                        ? 'إضافة ${kindLabels[kind]}'
+                        : 'تعديل ${kindLabels[kind]}',
+                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+                  ),
+                  const SizedBox(height: 14),
+                  OutlinedButton.icon(
+                    icon: const Icon(Icons.calendar_today),
+                    label: Text('التاريخ: ${fmtDate(parseYmd(date))}'),
+                    onPressed: () async {
+                      final d = await showDatePicker(
+                        context: sheetContext,
+                        initialDate: parseYmd(date),
+                        firstDate: DateTime(2020),
+                        lastDate: DateTime(2100),
+                      );
+                      if (d != null) setSheet(() => date = ymd(d));
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: amount,
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: isReceived ? 'المبلغ المستلم ($currencyName)' : 'المبلغ ($currencyName)',
+                    ),
+                  ),
+                  if (!isReceived) ...[
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: title,
+                      decoration: InputDecoration(labelText: fieldLabels[kind]),
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: note,
+                    decoration: const InputDecoration(labelText: 'ملاحظة (اختياري)'),
+                  ),
+                  const SizedBox(height: 18),
+                  FilledButton(
+                    onPressed: () async {
+                      final value = int.tryParse(amount.text.trim());
+                      if (value == null || value <= 0) {
+                        ScaffoldMessenger.of(sheetContext).showSnackBar(
+                          const SnackBar(content: Text('أدخل مبلغاً صحيحاً أكبر من صفر')),
+                        );
+                        return;
+                      }
+                      if (!isReceived && title.text.trim().isEmpty) {
+                        ScaffoldMessenger.of(sheetContext).showSnackBar(
+                          const SnackBar(content: Text('هذا الحقل مطلوب')),
+                        );
+                        return;
+                      }
+                      await Store.upsert('entries', {
+                        'id': existing?['id'] ?? Store.newId(),
+                        'kind': kind,
+                        'date': date,
+                        'amount': value,
+                        'title': isReceived ? '' : title.text.trim(),
+                        'note': note.text.trim(),
+                      });
+                      if (sheetContext.mounted) Navigator.pop(sheetContext);
+                    },
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: Text('حفظ', style: TextStyle(fontSize: 18)),
+                    ),
+                  ),
+                  if (existing != null)
+                    TextButton(
+                      onPressed: () async {
+                        await Store.remove('entries', existing['id'] as String);
+                        if (sheetContext.mounted) Navigator.pop(sheetContext);
+                      },
+                      child: const Text('حذف', style: TextStyle(color: Colors.red)),
+                    ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    },
+  );
+  amount.dispose();
+  title.dispose();
+  note.dispose();
+}
+===FILE: lib/screens/home.dart ===
+import 'package:flutter/material.dart';
+import '../core/auth.dart';
+import '../core/ledger.dart';
+import '../core/store.dart';
+import '../core/util.dart';
+import '../core/widgets.dart';
+import 'entry_sheet.dart';
+import 'settings.dart';
+
+/// الواجهة الرئيسية: الرصيد الحالي، وإضافة سريعة، وحركات اليوم.
+class HomeTab extends StatelessWidget {
+  const HomeTab({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder(
+      valueListenable: Store.listenable,
+      builder: (context, box, child) {
+        final rows = Ledger.build();
+        final balance = Ledger.currentBalance(rows);
+        final now = DateTime.now();
+        final today = ymd(now);
+        final todayRows = rows.where((r) => r.date == today).toList();
+        final todayEntries = entriesOn(today);
+
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text('البزي'),
+            actions: [
+              IconButton(
+                tooltip: 'الإعدادات',
+                icon: const Icon(Icons.settings_outlined),
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const SettingsScreen()),
+                ),
+              ),
+            ],
+          ),
+          body: ListView(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(4, 4, 4, 12),
+                child: Text(
+                  'أهلاً بك يا ${Auth.username}',
+                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
+                ),
+              ),
+              _balanceCard(context, balance),
+              const SectionTitle('إضافة سريعة'),
+              Row(
+                children: [
+                  _quick(context, kindExpense),
+                  const SizedBox(width: 8),
+                  _quick(context, kindPurchase),
+                  const SizedBox(width: 8),
+                  _quick(context, kindTransport),
+                  const SizedBox(width: 8),
+                  _quick(context, kindReceived),
+                ],
+              ),
+              SectionTitle('اليوم: ${dayName(now)} ${fmtDate(now)}'),
+              if (todayRows.isNotEmpty) _todaySummary(todayRows.first),
+              if (todayEntries.isEmpty)
+                const AppCard(child: Center(child: Text('لا توجد حركات اليوم')))
+              else
+                for (final e in todayEntries) entryCard(context, e),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _balanceCard(BuildContext context, int balance) {
+    final isDebt = balance < 0;
+    final color = isDebt ? Colors.red : Colors.green;
+    return AppCard(
+      padding: const EdgeInsets.all(22),
+      child: Column(
+        children: [
+          Text(
+            isDebt ? 'المديونية' : 'المتبقي',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            money(balance.abs()),
+            style: TextStyle(fontSize: 30, fontWeight: FontWeight.w900, color: color),
+          ),
+          const SizedBox(height: 4),
+          Text(isDebt ? 'عليك لم تُسدَّد بعد' : 'الرصيد الحالي المتاح'),
+        ],
+      ),
+    );
+  }
+
+  Widget _todaySummary(DayRow r) {
+    return AppCard(
+      child: Column(
+        children: [
+          _line('بداية اليوم', money(r.start)),
+          _line('المستلم', money(r.received)),
+          _line('المصروف', money(r.spent)),
+          const Divider(),
+          _line(
+            r.end >= 0 ? 'المتبقي' : 'المديونية',
+            money(r.end.abs()),
+            color: r.end >= 0 ? Colors.green : Colors.red,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _line(String label, String value, {Color? color}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label),
+          Text(value, style: TextStyle(fontWeight: FontWeight.w800, color: color)),
+        ],
+      ),
+    );
+  }
+
+  Widget _quick(BuildContext context, String kind) {
+    final color = Theme.of(context).colorScheme.primary;
+    return Expanded(
+      child: Material(
+        color: Theme.of(context).colorScheme.primaryContainer,
+        borderRadius: BorderRadius.circular(18),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(18),
+          onTap: () => openEntrySheet(context, kind: kind),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            child: Column(
+              children: [
+                Icon(kindIcon(kind), color: color),
+                const SizedBox(height: 6),
+                Text(
+                  kind == kindReceived ? 'استلام' : kindLabels[kind]!.replaceFirst('ال', ''),
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+===FILE: lib/screens/reports.dart ===
+import 'package:flutter/material.dart';
+import '../core/ledger.dart';
+import '../core/store.dart';
+import '../core/util.dart';
+import '../core/widgets.dart';
+import 'day_detail.dart';
+
+enum _Mode { daily, weekly, range, monthly }
+
+/// التقارير: يومي، أسبوعي، من تاريخ إلى تاريخ، أو شهري. كل يوم يُفتح لعرض تفاصيله ومرفقاته.
+class ReportsTab extends StatefulWidget {
+  const ReportsTab({super.key});
+
+  @override
+  State<ReportsTab> createState() => _ReportsTabState();
+}
+
+class _ReportsTabState extends State<ReportsTab> {
+  _Mode _mode = _Mode.daily;
+  final DateTime _today = () {
+    final n = DateTime.now();
+    return DateTime(n.year, n.month, n.day);
+  }();
+  late DateTime _from = _today;
+  late DateTime _to = _today;
+  late int _year = _today.year;
+  late int _month = _today.month;
+
+  /// الفترة المختارة بصيغة yyyy-MM-dd، لأن المقارنة النصية تعمل على هذه الصيغة.
+  (String, String) _range() {
+    switch (_mode) {
+      case _Mode.daily:
+        return (ymd(_today), ymd(_today));
+      case _Mode.weekly:
+        return (ymd(_today.subtract(const Duration(days: 6))), ymd(_today));
+      case _Mode.range:
+        return (ymd(_from), ymd(_to));
+      case _Mode.monthly:
+        return (ymd(DateTime(_year, _month, 1)), ymd(DateTime(_year, _month + 1, 0)));
+    }
+  }
+
+  Future<void> _pickDate(bool isFrom) async {
+    final d = await showDatePicker(
+      context: context,
+      initialDate: isFrom ? _from : _to,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+    );
+    if (d == null) return;
+    setState(() => isFrom ? _from = d : _to = d);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder(
+      valueListenable: Store.listenable,
+      builder: (context, box, child) {
+        final (from, to) = _range();
+        final rows = Ledger.build()
+            .where((r) => r.date.compareTo(from) >= 0 && r.date.compareTo(to) <= 0)
+            .toList();
+        final received = rows.fold<int>(0, (s, r) => s + r.received);
+        final spent = rows.fold<int>(0, (s, r) => s + r.spent);
+        final last = rows.isEmpty ? null : rows.last;
+
+        final balanceText = last == null
+            ? 'لا توجد حركات في هذه الفترة'
+            : last.end >= 0
+                ? 'المتبقي: ${money(last.end)}'
+                : 'المديونية: ${money(-last.end)}';
+
+        return Scaffold(
+          appBar: AppBar(title: const Text('التقارير')),
+          body: ListView(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _chip('يومي', _Mode.daily),
+                  _chip('أسبوعي', _Mode.weekly),
+                  _chip('من - إلى', _Mode.range),
+                  _chip('شهري', _Mode.monthly),
+                ],
+              ),
+              const SizedBox(height: 12),
+              if (_mode == _Mode.range)
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => _pickDate(true),
+                        child: Text('من ${fmtDate(_from)}'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => _pickDate(false),
+                        child: Text('إلى ${fmtDate(_to)}'),
+                      ),
+                    ),
+                  ],
+                ),
+              if (_mode == _Mode.monthly)
+                Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<int>(
+                        value: _month,
+                        decoration: const InputDecoration(labelText: 'الشهر'),
+                        items: [
+                          for (var m = 1; m <= 12; m++)
+                            DropdownMenuItem(value: m, child: Text('$m')),
+                        ],
+                        onChanged: (v) => setState(() => _month = v!),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: DropdownButtonFormField<int>(
+                        value: _year,
+                        decoration: const InputDecoration(labelText: 'السنة'),
+                        items: [
+                          for (final y in ({for (var y = 2024; y <= 2035; y++) y, _year}.toList()..sort()))
+                            DropdownMenuItem(value: y, child: Text('$y')),
+                        ],
+                        onChanged: (v) => setState(() => _year = v!),
+                      ),
+                    ),
+                  ],
+                ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(child: StatTile(value: money(received), label: 'المستلم')),
+                  const SizedBox(width: 10),
+                  Expanded(child: StatTile(value: money(spent), label: 'المصروف')),
+                ],
+              ),
+              const SizedBox(height: 4),
+              AppCard(
+                child: Column(
+                  children: [
+                    Text(
+                      balanceText,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                        color: last != null && last.end < 0 ? Colors.red : Colors.green,
+                      ),
+                    ),
+                    if (last != null) Text('حتى ${fmtDate(parseYmd(last.date))}'),
+                  ],
+                ),
+              ),
+              const SectionTitle('تفاصيل الأيام'),
+              if (rows.isEmpty)
+                const AppCard(child: Center(child: Text('لا توجد حركات في هذه الفترة'))),
+              for (final r in rows.reversed) _dayRow(context, r),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _chip(String label, _Mode mode) {
+    return ChoiceChip(
+      label: Text(label),
+      selected: _mode == mode,
+      onSelected: (_) => setState(() => _mode = mode),
+    );
+  }
+
+  Widget _dayRow(BuildContext context, DayRow r) {
+    final date = parseYmd(r.date);
+    return AppCard(
+      onTap: () => openDayDetail(context, r.date),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${dayName(date)} ${fmtDate(date)}',
+            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 6),
+          Text('بداية اليوم: ${money(r.start)}'),
+          Text('المستلم: ${money(r.received)}  •  المصروف: ${money(r.spent)}'),
+          Text(
+            r.end >= 0 ? 'المتبقي: ${money(r.end)}' : 'المديونية: ${money(-r.end)}',
+            style: TextStyle(
+              fontWeight: FontWeight.w800,
+              color: r.end >= 0 ? Colors.green : Colors.red,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+===FILE: lib/screens/section.dart ===
+import 'package:flutter/material.dart';
+import '../core/store.dart';
+import '../core/ledger.dart';
+import '../core/util.dart';
+import '../core/widgets.dart';
+import 'entry_sheet.dart';
+
+/// شاشة قسم: النفقات أو المشتريات أو المواصلات. الحركات مجمّعة حسب اليوم.
+class SectionScreen extends StatelessWidget {
+  const SectionScreen({super.key, required this.kind});
+
+  final String kind;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder(
+      valueListenable: Store.listenable,
+      builder: (context, box, child) {
+        final entries = Store.all('entries').where((e) => e['kind'] == kind).toList()
+          ..sort((a, b) => (b['date'] as String).compareTo(a['date'] as String));
+        final total = sumOf(entries);
+
+        final groups = <String, List<Map<String, dynamic>>>{};
+        for (final e in entries) {
+          groups.putIfAbsent(e['date'] as String, () => []).add(e);
+        }
+
+        return Scaffold(
+          appBar: AppBar(title: Text(kindLabels[kind]!)),
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: () => openEntrySheet(context, kind: kind),
+            icon: const Icon(Icons.add),
+            label: const Text('إضافة'),
+          ),
+          body: ListView(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 90),
+            children: [
+              AppCard(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('إجمالي ${kindLabels[kind]}',
+                        style: const TextStyle(fontWeight: FontWeight.w700)),
+                    Text(money(total),
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w900,
+                          color: Theme.of(context).colorScheme.primary,
+                        )),
+                  ],
+                ),
+              ),
+              if (entries.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(30),
+                  child: Center(child: Text('لا توجد حركات بعد')),
+                ),
+              for (final date in groups.keys) ...[
+                SectionTitle(
+                  '${dayName(parseYmd(date))} ${fmtDate(parseYmd(date))}  •  ${money(sumOf(groups[date]!))}',
+                ),
+                for (final e in groups[date]!) entryCard(context, e),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+===FILE: lib/screens/settings.dart ===
+import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
+import '../core/auth.dart';
+import '../core/store.dart';
+import '../core/widgets.dart';
+import 'auth_screen.dart';
+import 'backup_screen.dart';
+
+/// الإعدادات: المظهر، والنسخ الاحتياطي، ومسح البيانات، ومعلومات التطبيق.
+class SettingsScreen extends StatelessWidget {
+  const SettingsScreen({super.key});
+
+  static const appVersion = '1.0.0';
+  static const developerName = 'المهندس سامي الصلاحي';
+  static const developerPhone = '772798471';
+
+  Future<void> _showContactSheet(BuildContext context) async {
+    final intlPhone = '967$developerPhone';
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'التواصل مع $developerName',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              icon: const Icon(Icons.call),
+              label: const Text('اتصال'),
+              onPressed: () async {
+                Navigator.pop(sheetContext);
+                await launchUrl(Uri.parse('tel:+$intlPhone'));
+              },
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.chat),
+              label: const Text('واتساب'),
+              onPressed: () async {
+                Navigator.pop(sheetContext);
+                await launchUrl(
+                  Uri.parse('https://wa.me/$intlPhone'),
+                  mode: LaunchMode.externalApplication,
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmReset(BuildContext context) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('مسح كل البيانات؟'),
+        content: const Text('سيتم حذف كل الحركات والمرفقات نهائياً. احفظ نسخة احتياطية قبل ذلك.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('نعم، امسح')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    Navigator.of(context).popUntil((r) => r.isFirst);
+    await Store.wipe();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder(
+      valueListenable: Store.listenable,
+      builder: (context, box, child) {
+        final theme = Store.setting<String>('theme', 'dark');
+        return Scaffold(
+          appBar: AppBar(title: const Text('الإعدادات')),
+          body: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              const SectionTitle('الحساب'),
+              AppCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text('اسم المستخدم: ${Auth.username}',
+                        style: const TextStyle(fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.person_outline),
+                      label: const Text('تغيير اسم المستخدم'),
+                      onPressed: () => openChangeUsername(context),
+                    ),
+                    const SizedBox(height: 10),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.lock_outline),
+                      label: const Text('تغيير كلمة المرور'),
+                      onPressed: () => openChangePassword(context),
+                    ),
+                    const SizedBox(height: 10),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.logout),
+                      label: const Text('تسجيل الخروج'),
+                      onPressed: () {
+                        Navigator.of(context).popUntil((r) => r.isFirst);
+                        Auth.logout();
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              const SectionTitle('المظهر'),
+              AppCard(
+                child: SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(value: 'dark', label: Text('داكن')),
+                    ButtonSegment(value: 'light', label: Text('فاتح')),
+                    ButtonSegment(value: 'system', label: Text('تلقائي')),
+                  ],
+                  selected: {theme},
+                  onSelectionChanged: (s) => Store.setSetting('theme', s.first),
+                ),
+              ),
+              const SectionTitle('البيانات'),
+              AppCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text('بياناتك محفوظة مشفّرة على هذا الجهاز فقط.'),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.backup_outlined),
+                      label: const Text('النسخ الاحتياطي والاستعادة'),
+                      onPressed: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => const BackupScreen()),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    FilledButton.tonal(
+                      style: FilledButton.styleFrom(foregroundColor: Colors.red),
+                      onPressed: () => _confirmReset(context),
+                      child: const Text('مسح كل البيانات'),
+                    ),
+                  ],
+                ),
+              ),
+              const SectionTitle('حول التطبيق'),
+              AppCard(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('البزي', style: TextStyle(fontWeight: FontWeight.w900)),
+                    Text('الإصدار $appVersion'),
+                    Text('تصميم وتطوير: $developerName'),
+                    InkWell(
+                      onTap: () => _showContactSheet(context),
+                      child: Text(
+                        'للتواصل: $developerPhone',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.primary,
+                          decoration: TextDecoration.underline,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+===FILE: lib/shell.dart ===
+import 'package:flutter/material.dart';
+import 'core/util.dart';
+import 'screens/home.dart';
+import 'screens/reports.dart';
+import 'screens/section.dart';
+
+/// الهيكل الرئيسي: خمسة أقسام في الشريط السفلي.
+class AppShell extends StatefulWidget {
+  const AppShell({super.key});
+
+  @override
+  State<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<AppShell> {
+  int _index = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: _index,
+        children: const [
+          HomeTab(),
+          SectionScreen(kind: kindExpense),
+          SectionScreen(kind: kindPurchase),
+          SectionScreen(kind: kindTransport),
+          ReportsTab(),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _index,
+        onDestinationSelected: (i) => setState(() => _index = i),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.home_outlined),
+            selectedIcon: Icon(Icons.home),
+            label: 'الرئيسية',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.receipt_long_outlined),
+            selectedIcon: Icon(Icons.receipt_long),
+            label: 'النفقات',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.shopping_bag_outlined),
+            selectedIcon: Icon(Icons.shopping_bag),
+            label: 'المشتريات',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.directions_bus_outlined),
+            selectedIcon: Icon(Icons.directions_bus),
+            label: 'المواصلات',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.bar_chart_outlined),
+            selectedIcon: Icon(Icons.bar_chart),
+            label: 'التقارير',
+          ),
+        ],
+      ),
+    );
+  }
+}
